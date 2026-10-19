@@ -1,0 +1,9 @@
+include: package:flutter_lints/flutter.yaml
+
+analyzer:
+  errors:
+    unused_element: warning
+    avoid_print: warning
+  exclude:
+    - build/**
+    - android/**

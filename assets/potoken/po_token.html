@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+<body>
+<script>
+var webPoSignalOutput = null;
+var integrityToken = null;
+
+function runBotGuard(challengeData) {
+    return new Promise(function(resolve, reject) {
+        try {
+            var program = challengeData.program;
+            var globalName = challengeData.globalName;
+            var interpreterJavascript = challengeData.interpreterJavascript;
+
+            if (interpreterJavascript && interpreterJavascript.privateDoNotAccessOrElseSafeScriptWrappedValue) {
+                eval(interpreterJavascript.privateDoNotAccessOrElseSafeScriptWrappedValue);
+            }
+
+            if (interpreterJavascript && interpreterJavascript.privateDoNotAccessOrElseTrustedResourceUrlWrappedValue) {
+                var script = document.createElement('script');
+                script.src = interpreterJavascript.privateDoNotAccessOrElseTrustedResourceUrlWrappedValue;
+                script.onload = function() {
+                    executeBotGuard(program, globalName, challengeData, resolve, reject);
+                };
+                script.onerror = function() {
+                    reject(new Error('Failed to load interpreter script'));
+                };
+                document.head.appendChild(script);
+            } else {
+                executeBotGuard(program, globalName, challengeData, resolve, reject);
+            }
+        } catch (error) {
+            reject(error);
+        }
+    });
+}
+
+function executeBotGuard(program, globalName, challengeData, resolve, reject) {
+    try {
+        var botguardCallback = function(result) {
+            resolve({
+                botguardResponse: result,
+                webPoSignalOutput: webPoSignalOutput
+            });
+        };
+
+        var bg = new window[globalName](
+            {
+                program: program,
+                globalName: challengeData.globalName,
+                clientExperimentsStateBlob: challengeData.clientExperimentsStateBlob
+            },
+            {
+                vmFunctions: {
+                    burst: function() {},
+                    privateDoNotAccessOrElseSafeScriptWrappedValue: function() {}
+                }
+            },
+            function(response) {
+                botguardCallback(response);
+            }
+        );
+
+        bg.invoke();
+    } catch (error) {
+        reject(error);
+    }
+}
+
+function createPoTokenMinter(signalOutput, integrityTokenData) {
+    return new Promise(function(resolve, reject) {
+        try {
+            webPoSignalOutput = signalOutput;
+            integrityToken = integrityTokenData;
+            resolve();
+        } catch (error) {
+            reject(error);
+        }
+    });
+}
+
+function obtainPoToken(identifier) {
+    return new Promise(function(resolve, reject) {
+        try {
+            if (!webPoSignalOutput) {
+                reject(new Error('webPoSignalOutput not initialized'));
+                return;
+            }
+
+            if (!integrityToken) {
+                reject(new Error('integrityToken not initialized'));
+                return;
+            }
+
+            var minter = new WebPoMinter(webPoSignalOutput, integrityToken);
+            minter.mint(identifier).then(function(poToken) {
+                resolve(poToken);
+            }).catch(function(error) {
+                reject(error);
+            });
+        } catch (error) {
+            reject(error);
+        }
+    });
+}
+</script>
+</body>
+</html>
