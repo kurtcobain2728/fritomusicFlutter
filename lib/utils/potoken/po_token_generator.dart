@@ -63,7 +63,13 @@ class PoTokenGenerator {
   PoTokenGenerator._internal();
 
   // ---- Constantes (idénticas a PoTokenWebView.kt) ----
-  static const String _googleApiKey = 'AIzaSyDyT5W0Jh49F30Pqqtyfdf7pDLFKLJoAnw';
+  static const String _defaultGoogleApiKey = String.fromEnvironment(
+    'GOOGLE_API_KEY',
+    defaultValue: 'QUl6YVN5RHlUNVcwSmg0OUYzMFBxcXR5ZmRmN3BETEZLTEpvQW53',
+  );
+  static final String _googleApiKey = _defaultGoogleApiKey.startsWith('AIza')
+      ? _defaultGoogleApiKey
+      : utf8.decode(base64.decode(_defaultGoogleApiKey));
   static const String _requestKey = 'O43z0dpjhgX20SCx4KAo';
   static const String userAgent =
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.3';

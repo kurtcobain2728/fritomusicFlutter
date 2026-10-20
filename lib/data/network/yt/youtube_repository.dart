@@ -73,13 +73,10 @@ class YouTubeRepository {
   /// adjunta a la URL de stream como `?pot=`. Si el WebView del generador no
   /// está disponible, devuelve `null` y la cascada normal continúa.
   Future<String?> _resolveWebRemixWithPoToken(InnerTubeClient client, String videoId) async {
-    String? sessionId = client.dataSyncId?.trim();
-    if (sessionId == null || sessionId.isEmpty) {
-      sessionId = (await client.ensureVisitorData())?.trim();
-    }
-    if (sessionId == null || sessionId.isEmpty) return null;
+    final visitorData = (await client.ensureVisitorData())?.trim();
+    if (visitorData == null || visitorData.isEmpty) return null;
 
-    final poToken = await PoTokenGenerator.instance.getWebClientPoToken(videoId, sessionId);
+    final poToken = await PoTokenGenerator.instance.getWebClientPoToken(videoId, visitorData);
     if (poToken == null) {
       // Sin PoToken el cliente WEB_REMIX devuelve UNPLAYABLE siempre
       // (verificado empíricamente): no gastar el request de /player.
@@ -87,13 +84,17 @@ class YouTubeRepository {
       return null;
     }
 
-    final data = await client.getPlayer(videoId, poToken: poToken.playerRequestPoToken);
+    final data = await client.getPlayer(
+      videoId,
+      poToken: poToken.playerRequestPoToken,
+      visitorData: visitorData,
+    );
     if (data == null) return null;
 
     final status = data['playabilityStatus'];
     if (status is Map && status['status'] != 'OK') return null;
 
-    var url = await _extractBestAudioUrl(data);
+    var url = await _extractBestAudioUrl(data, poToken: poToken.streamingDataPoToken);
     if (url == null || url.isEmpty) return null;
 
     final streamingPot = poToken.streamingDataPoToken;

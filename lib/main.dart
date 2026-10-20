@@ -15,7 +15,7 @@ import 'providers/player_provider.dart';
 import 'providers/stream_provider.dart';
 import 'providers/theme_provider.dart';
 import 'services/audio_handler.dart';
-import 'services/local_stream_proxy.dart';
+import 'services/youtube_stream_proxy.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -30,8 +30,8 @@ Future<void> main() async {
     ),
   );
 
-  // Pre-iniciar proxy local para streaming instantáneo sin bloqueos 403
-  unawaited(LocalStreamProxy.instance.ensureStarted());
+  // Pre-iniciar proxy local para streaming instantáneo sin bloqueos 403 ni cortes a los 30-60s
+  unawaited(YouTubeStreamProxy.instance.ensureInitialized());
 
   // Inicializar Background Audio Service
   final fritoHandler = FritoAudioHandler();

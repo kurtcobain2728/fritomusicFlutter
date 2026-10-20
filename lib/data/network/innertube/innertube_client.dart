@@ -785,10 +785,16 @@ class InnerTubeClient {
   }
 
   /// Información del reproductor nativo de YouTube
-  Future<Map<String, dynamic>?> getPlayer(String videoId, {String? poToken}) async {
+  Future<Map<String, dynamic>?> getPlayer(String videoId, {String? poToken, String? visitorData}) async {
     try {
+      if (visitorData != null && visitorData.trim().isNotEmpty) {
+        this.visitorData = visitorData.trim();
+      }
       final hasAuth = cookie != null && cookie!.trim().isNotEmpty;
       final context = _buildContext(withAuth: hasAuth);
+      if (visitorData != null && visitorData.trim().isNotEmpty) {
+        (context['client'] as Map<String, dynamic>?)?['visitorData'] = visitorData.trim();
+      }
       if (poToken != null && poToken.isNotEmpty) {
         (context['serviceIntegrityDimensions'] ??= {})['poToken'] = poToken;
       }

@@ -7,11 +7,18 @@ import '../data/models/audio_file.dart';
 import '../data/network/yt/stream_client_utils.dart';
 import '../data/network/yt/youtube_repository.dart';
 import 'equalizer_service.dart';
-import 'local_stream_proxy.dart';
 import 'stream_error_bus.dart';
+import 'youtube_stream_proxy.dart';
 
 class FritoAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
-  final AudioPlayer _player = AudioPlayer();
+  final AudioPlayer _player = AudioPlayer(
+    audioLoadConfiguration: const AudioLoadConfiguration(
+      androidLoadControl: AndroidLoadControl(
+        minBufferDuration: Duration(seconds: 50),
+        maxBufferDuration: Duration(seconds: 120),
+      ),
+    ),
+  );
 
   List<AudioFile> _playlist = [];
   int _currentIndex = -1;
@@ -167,12 +174,21 @@ class FritoAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler 
 
       final isHls = StreamClientUtils.isHlsUrl(freshUrl);
       final isYouTube = StreamClientUtils.isYouTubeMediaHost(Uri.parse(freshUrl).host);
-      final effectiveUrl = (!isHls && isYouTube)
-          ? await LocalStreamProxy.instance.getProxyUrlAsync(freshUrl)
-          : freshUrl;
-      final headers = isHls
-          ? {'User-Agent': StreamClientUtils.safariUserAgent}
-          : (isYouTube ? null : {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:140.0) Gecko/20100101 Firefox/140.0'});
+      String effectiveUrl = freshUrl;
+      Map<String, String>? headers;
+
+      if (isHls) {
+        headers = {'User-Agent': StreamClientUtils.safariUserAgent};
+      } else if (isYouTube) {
+        final profile = StreamClientUtils.resolveRequestProfile(freshUrl);
+        final localProxyUri = await YouTubeStreamProxy.instance.registerStream(
+          streamUrl: freshUrl,
+          userAgent: profile.userAgent,
+        );
+        effectiveUrl = localProxyUri.toString();
+      } else {
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:140.0) Gecko/20100101 Firefox/140.0'};
+      }
 
       await _player.setAudioSource(
         AudioSource.uri(
@@ -257,7 +273,12 @@ class FritoAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler 
           headers = {'User-Agent': StreamClientUtils.safariUserAgent};
         } else if (isYouTube) {
           try {
-            effectivePlayUrl = await LocalStreamProxy.instance.getProxyUrlAsync(playPath);
+            final profile = StreamClientUtils.resolveRequestProfile(playPath);
+            final localProxyUri = await YouTubeStreamProxy.instance.registerStream(
+              streamUrl: playPath,
+              userAgent: profile.userAgent,
+            );
+            effectivePlayUrl = localProxyUri.toString();
             debugPrint('[FritoAudioHandler] Reproduciendo YouTube vía proxy local: $effectivePlayUrl');
           } catch (e) {
             throw StateError('Proxy local de stream no disponible: $e');
@@ -287,12 +308,20 @@ class FritoAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler 
             if (freshUrl != null && freshUrl != playPath) {
               final isYtHls = StreamClientUtils.isHlsUrl(freshUrl);
               final isYtFresh = StreamClientUtils.isYouTubeMediaHost(Uri.parse(freshUrl).host);
-              final freshEffective = (!isYtHls && isYtFresh)
-                  ? await LocalStreamProxy.instance.getProxyUrlAsync(freshUrl)
-                  : freshUrl;
-              final freshHeaders = isYtHls
-                  ? {'User-Agent': StreamClientUtils.safariUserAgent}
-                  : (isYtFresh ? null : {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:140.0) Gecko/20100101 Firefox/140.0'});
+              String freshEffective = freshUrl;
+              Map<String, String>? freshHeaders;
+              if (isYtHls) {
+                freshHeaders = {'User-Agent': StreamClientUtils.safariUserAgent};
+              } else if (isYtFresh) {
+                final profile = StreamClientUtils.resolveRequestProfile(freshUrl);
+                final localProxyUri = await YouTubeStreamProxy.instance.registerStream(
+                  streamUrl: freshUrl,
+                  userAgent: profile.userAgent,
+                );
+                freshEffective = localProxyUri.toString();
+              } else {
+                freshHeaders = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:140.0) Gecko/20100101 Firefox/140.0'};
+              }
               await _player.setAudioSource(
                 AudioSource.uri(
                   Uri.parse(freshEffective),
