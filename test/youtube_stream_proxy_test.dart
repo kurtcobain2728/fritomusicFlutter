@@ -43,5 +43,64 @@ void main() {
       await res.drain();
       client.close();
     });
+
+    test('Pre-buffering progresivo en RAM entrega datos con servidor HTTP mock', () async {
+      // Mock server simulando upstream de googlevideo con soporte de &range=
+      final mockUpstream = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      final dummyData = List<int>.generate(256 * 1024, (i) => i % 256); // 256 KB
+
+      mockUpstream.listen((request) async {
+        final rangeParam = request.uri.queryParameters['range'];
+        int start = 0;
+        int end = dummyData.length - 1;
+        if (rangeParam != null && rangeParam.contains('-')) {
+          final parts = rangeParam.split('-');
+          start = int.tryParse(parts[0]) ?? 0;
+          end = int.tryParse(parts[1]) ?? end;
+        }
+
+        if (start >= dummyData.length) {
+          request.response.statusCode = HttpStatus.requestedRangeNotSatisfiable;
+          await request.response.close();
+          return;
+        }
+
+        final sliceEnd = (end < dummyData.length) ? end : dummyData.length - 1;
+        final slice = dummyData.sublist(start, sliceEnd + 1);
+
+        request.response.statusCode = HttpStatus.partialContent;
+        request.response.headers.set(HttpHeaders.contentRangeHeader, 'bytes $start-$sliceEnd/${dummyData.length}');
+        request.response.headers.set(HttpHeaders.contentLengthHeader, slice.length.toString());
+        request.response.add(slice);
+        await request.response.close();
+      });
+
+      try {
+        await proxy.ensureInitialized();
+        final upstreamUrl = 'http://127.0.0.1:${mockUpstream.port}/videoplayback?expire=999&clen=${dummyData.length}&mime=audio%2Fmp4';
+        final localUri = await proxy.registerStream(
+          streamUrl: upstreamUrl,
+          userAgent: 'test-agent',
+        );
+
+        // Cliente descargando desde el proxy local
+        final client = HttpClient();
+        final req = await client.getUrl(localUri);
+        req.headers.set(HttpHeaders.rangeHeader, 'bytes=0-${dummyData.length - 1}');
+        final res = await req.close();
+
+        expect(res.statusCode, equals(HttpStatus.partialContent));
+        final receivedBytes = <int>[];
+        await for (final chunk in res) {
+          receivedBytes.addAll(chunk);
+        }
+
+        expect(receivedBytes.length, equals(dummyData.length));
+        expect(receivedBytes, equals(dummyData));
+        client.close();
+      } finally {
+        await mockUpstream.close(force: true);
+      }
+    });
   });
 }

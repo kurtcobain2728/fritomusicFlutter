@@ -47,18 +47,29 @@ class YouTubeRepository {
     HttpClient? client;
     try {
       final uri = Uri.parse(url);
+      final isHls = StreamClientUtils.isHlsUrl(url);
+      final isYouTube = StreamClientUtils.isYouTubeMediaHost(uri.host);
+      final profile = StreamClientUtils.resolveRequestProfile(url);
+
       client = HttpClient()..connectionTimeout = const Duration(seconds: 8);
       final request = await client.getUrl(uri).timeout(const Duration(seconds: 8));
-      final profile = StreamClientUtils.resolveRequestProfile(url);
-      final isYouTube = StreamClientUtils.isYouTubeMediaHost(uri.host);
-      request.headers.set('Range', 'bytes=0-0');
+
       if (isYouTube) {
         profile.headers.forEach((k, v) => request.headers.set(k, v));
       }
+
+      if (!isHls) {
+        // Probamos más allá de los primeros 512 KB (barrera de ~30s) para descartar
+        // URLs directas que YouTube bloquea tras el burst inicial.
+        final clen = int.tryParse(uri.queryParameters['clen'] ?? '');
+        final probeOffset = (clen != null && clen > 700000) ? 655360 : 0;
+        request.headers.set('Range', 'bytes=$probeOffset-${probeOffset + 1}');
+      }
+
       final response = await request.close().timeout(const Duration(seconds: 8));
       final code = response.statusCode;
-      response.drain();
-      return (code >= 200 && code < 400) || code == 416;
+      await response.drain();
+      return code >= 200 && code < 400;
     } catch (_) {
       return false;
     } finally {
@@ -206,38 +217,12 @@ class YouTubeRepository {
       return cached;
     }
 
-    // 1. Intentar resolver audio de alta fidelidad (320 kbps) sin cuota vía JioSaavn
-    if (title != null && title.trim().isNotEmpty) {
-      try {
-        final saavn = await SaavnResolver.resolve(title.trim(), (artist ?? '').trim());
-        if (saavn != null && saavn.streamUrl.isNotEmpty) {
-          _streamUrlCache[videoId] = _CachedUrl(saavn.streamUrl, DateTime.now().millisecondsSinceEpoch);
-          debugPrint('[StreamResolve] $videoId OK vía Saavn');
-          return saavn.streamUrl;
-        }
-      } catch (e) {
-        debugPrint('[StreamResolve] Saavn falló para $videoId: $e');
-      }
-    }
-
     final client = InnerTubeClient.instance;
+    final visitorData = (await client.ensureVisitorData())?.trim();
 
-    // 2. WEB_REMIX + PoToken (BotGuard): la vía "oficial" del cliente web de
-    //    YouTube Music. Con timeout de 4s para nunca congelar la reproducción.
-    try {
-      final resolved = await _resolveWebRemixWithPoToken(client, videoId)
-          .timeout(const Duration(seconds: 4), onTimeout: () => null);
-      if (resolved != null && resolved.isNotEmpty) {
-        _streamUrlCache[videoId] = _CachedUrl(resolved, DateTime.now().millisecondsSinceEpoch);
-        debugPrint('[StreamResolve] $videoId OK vía WEB_REMIX+PoToken');
-        return resolved;
-      }
-    } catch (e) {
-      debugPrint('[StreamResolve] WEB_REMIX+PoToken falló para $videoId: $e');
-    }
-
-    // 3. Probar cliente preferido nativo IOS via InnerTube (devuelve streams
-    //    directos sin cifrado n-sig de forma ultra rápida)
+    // 1. Probar cliente IOS buscando primero su hlsManifestUrl (.m3u8),
+    //    que NO sufre del corte de 30-60s (1 MB) ni requiere PoToken.
+    String? iosAdaptiveFallback;
     try {
       final sts = await SignatureTimestampService.instance.getSignatureTimestamp();
       final response = await _dio.post(
@@ -253,10 +238,12 @@ class YouTubeRepository {
               'osVersion': '18.2.22C152',
               'hl': client.hl,
               'gl': client.gl,
-              if (client.visitorData != null) 'visitorData': client.visitorData,
+              if (visitorData != null && visitorData.isNotEmpty) 'visitorData': visitorData,
             }
           },
           'videoId': videoId,
+          'contentCheckOk': true,
+          'racyCheckOk': true,
           'playbackContext': {
             'contentPlaybackContext': {
               'signatureTimestamp': sts,
@@ -274,39 +261,56 @@ class YouTubeRepository {
         ),
       );
 
-      final vDetails = response.data is Map ? (response.data['videoDetails'] as Map?) : null;
-      if (vDetails != null) {
-        final extractedTitle = vDetails['title']?.toString();
-        final extractedAuthor = vDetails['author']?.toString();
-        if (extractedTitle != null && extractedTitle.isNotEmpty) {
-          try {
-            final saavn = await SaavnResolver.resolve(extractedTitle, extractedAuthor ?? '');
-            if (saavn != null && saavn.streamUrl.isNotEmpty) {
-              _streamUrlCache[videoId] = _CachedUrl(saavn.streamUrl, DateTime.now().millisecondsSinceEpoch);
-              debugPrint('[StreamResolve] $videoId OK vía Saavn (metadatos IOS)');
-              return saavn.streamUrl;
-            }
-          } catch (_) {}
+      // 1A. Preferir HLS nativo de iOS (reproduce la canción completa sin corte al segundo 30)
+      final iosHlsUrl = response.data?['streamingData']?['hlsManifestUrl']?.toString();
+      if (iosHlsUrl != null && iosHlsUrl.isNotEmpty) {
+        if (await _entregarUrlValidada(videoId, iosHlsUrl, 'IOS_HLS')) {
+          return iosHlsUrl;
         }
       }
 
-      final url = await _extractBestAudioUrl(response.data);
-      if (url != null && await _entregarUrlValidada(videoId, url, 'IOS')) {
-        return url;
+      // Guardamos el adaptiveFormat de iOS solo como respaldo si pasa validación profunda
+      final rawUrl = await _extractBestAudioUrl(response.data);
+      if (rawUrl != null) {
+        iosAdaptiveFallback = _stripPoTokenIfPresent(rawUrl);
       }
     } catch (e) {
       debugPrint('[StreamResolve] cliente IOS falló para $videoId: $e');
     }
 
-    // 4. Probar cliente nativo ANDROID_VR
+    // 2. Probar HLS vía cliente WEB Safari (_resolveHls): inmune al límite de 1 MB / 30s
     try {
+      final hlsResolved = await _resolveHls(client, videoId);
+      if (hlsResolved != null && hlsResolved.isNotEmpty) {
+        return hlsResolved;
+      }
+    } catch (e) {
+      debugPrint('[StreamResolve] HLS Safari falló para $videoId: $e');
+    }
+
+    // 3. WEB_REMIX + PoToken (BotGuard): lleva pot explícito para evitar bloqueo de rango
+    try {
+      final resolved = await _resolveWebRemixWithPoToken(client, videoId)
+          .timeout(const Duration(seconds: 4), onTimeout: () => null);
+      if (resolved != null && resolved.isNotEmpty) {
+        _streamUrlCache[videoId] = _CachedUrl(resolved, DateTime.now().millisecondsSinceEpoch);
+        debugPrint('[StreamResolve] $videoId OK vía WEB_REMIX+PoToken');
+        return resolved;
+      }
+    } catch (e) {
+      debugPrint('[StreamResolve] WEB_REMIX+PoToken falló para $videoId: $e');
+    }
+
+    // 4. Probar cliente nativo ANDROID_VR (con visitorData y signatureTimestamp)
+    try {
+      final sts = await SignatureTimestampService.instance.getSignatureTimestamp();
       final response = await _dio.post(
         'https://www.youtube.com/youtubei/v1/player',
         data: jsonEncode({
           'context': {
             'client': {
               'clientName': 'ANDROID_VR',
-              'clientVersion': '1.43.32',
+              'clientVersion': '1.56.21',
               'deviceMake': 'Oculus',
               'deviceModel': 'Quest 3',
               'osName': 'Android',
@@ -314,61 +318,74 @@ class YouTubeRepository {
               'androidSdkVersion': 32,
               'gl': client.gl,
               'hl': client.hl,
+              if (visitorData != null && visitorData.isNotEmpty) 'visitorData': visitorData,
             }
           },
           'videoId': videoId,
+          'contentCheckOk': true,
+          'racyCheckOk': true,
+          'playbackContext': {
+            'contentPlaybackContext': {
+              'signatureTimestamp': sts,
+            }
+          }
         }),
         options: Options(
           headers: {
             'Content-Type': 'application/json',
             'User-Agent':
-                'com.google.android.apps.youtube.vr.oculus/1.43.32 (Linux; U; Android 12; en_US; Quest 3; Build/SQ3A.220605.009.A1; Cronet/107.0.5284.2)',
+                'com.google.android.apps.youtube.vr.oculus/1.56.21 (Linux; U; Android 12; en_US; Quest 3; Build/SQ3A.220605.009.A1; Cronet/107.0.5284.2)',
             'X-YouTube-Client-Name': '28',
-            'X-YouTube-Client-Version': '1.43.32',
+            'X-YouTube-Client-Version': '1.56.21',
           },
         ),
       );
 
-      final url = await _extractBestAudioUrl(response.data);
-      if (url != null && await _entregarUrlValidada(videoId, url, 'ANDROID_VR')) {
-        return url;
+      final vrHlsUrl = response.data?['streamingData']?['hlsManifestUrl']?.toString();
+      if (vrHlsUrl != null && vrHlsUrl.isNotEmpty) {
+        if (await _entregarUrlValidada(videoId, vrHlsUrl, 'ANDROID_VR_HLS')) {
+          return vrHlsUrl;
+        }
+      }
+
+      final rawUrl = await _extractBestAudioUrl(response.data);
+      if (rawUrl != null) {
+        final url = _stripPoTokenIfPresent(rawUrl);
+        if (await _entregarUrlValidada(videoId, url, 'ANDROID_VR')) {
+          return url;
+        }
       }
     } catch (e) {
       debugPrint('[StreamResolve] cliente ANDROID_VR falló para $videoId: $e');
     }
 
-    // 5. Fallback HLS (WEB Safari)
-    try {
-      final hlsResolved = await _resolveHls(client, videoId);
-      if (hlsResolved != null && hlsResolved.isNotEmpty) {
-        return hlsResolved;
+    // 5. Probar JioSaavn si el título está disponible
+    if (title != null && title.trim().isNotEmpty) {
+      try {
+        final saavn = await SaavnResolver.resolve(title.trim(), (artist ?? '').trim());
+        if (saavn != null && saavn.streamUrl.isNotEmpty) {
+          if (await _entregarUrlValidada(videoId, saavn.streamUrl, 'Saavn')) {
+            return saavn.streamUrl;
+          }
+        }
+      } catch (e) {
+        debugPrint('[StreamResolve] Saavn falló para $videoId: $e');
       }
-    } catch (e) {
-      debugPrint('[StreamResolve] Fallback HLS falló para $videoId: $e');
     }
 
-    // 3. TVHTML5_SIMPLY_EMBEDDED_PLAYER ELIMINADO (2026-10-15): devuelve
-    //    ERROR "YouTube ya no es compatible con esta aplicación o dispositivo"
-    //    (verificado empíricamente). Puede restaurarse si el cliente revive.
-    // 5. Fallback a getPlayer de InnerTubeClient (WEB_REMIX sin PoToken; solo
-    //    sirve con sesión logueada y contenido no restringido).
-    try {
-      final data = await InnerTubeClient.instance.getPlayer(videoId);
-      final url = await _extractBestAudioUrl(data);
-      if (url != null && await _entregarUrlValidada(videoId, url, 'WEB')) {
-        return url;
+    // 6. Respaldo de adaptiveFormat de IOS (solo si supera la validación de >640KB)
+    if (iosAdaptiveFallback != null) {
+      if (await _entregarUrlValidada(videoId, iosAdaptiveFallback, 'IOS_ADAPTIVE')) {
+        return iosAdaptiveFallback;
       }
-    } catch (e) {
-      debugPrint('[StreamResolve] fallback WEB falló para $videoId: $e');
     }
-
-    // 5. Piped / Invidious ELIMINADOS (2026-10-15): las 8 instancias
-    //    configuradas estaban muertas (526/502/sin respuesta/401) y solo
-    //    añadían esperas de hasta 8×6 s por canción fallida. Restaurar con una
-    //    lista dinámica de instancias vivas si se quiere ese fallback.
 
     debugPrint('[StreamResolve] $videoId SIN RESPUESTA de ningún cliente');
     return null;
+  }
+
+  String _stripPoTokenIfPresent(String url) {
+    return url.replaceAll(RegExp(r'([?&])pot=[^&]*'), '').replaceAll('?&', '?');
   }
 
   // Delegaciones rápidas

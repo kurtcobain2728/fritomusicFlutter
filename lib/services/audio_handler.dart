@@ -178,7 +178,12 @@ class FritoAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler 
       Map<String, String>? headers;
 
       if (isHls) {
-        headers = {'User-Agent': StreamClientUtils.safariUserAgent};
+        final profile = StreamClientUtils.resolveRequestProfile(freshUrl);
+        headers = {
+          'User-Agent': profile.userAgent,
+          if (profile.origin != null) 'Origin': profile.origin!,
+          if (profile.referer != null) 'Referer': profile.referer!,
+        };
       } else if (isYouTube) {
         final profile = StreamClientUtils.resolveRequestProfile(freshUrl);
         final localProxyUri = await YouTubeStreamProxy.instance.registerStream(
@@ -200,11 +205,11 @@ class FritoAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler 
       if (position > Duration.zero) {
         await _player.seek(position);
       }
-      if (wasPlaying) {
-        await _player.play();
-      }
       _lastFailedPath = null;
       _recoverAttempts = 0;
+      if (wasPlaying) {
+        unawaited(_player.play());
+      }
       debugPrint('[FritoAudioHandler] Recuperado tras error; reanudando en $position');
     } catch (e) {
       debugPrint('[FritoAudioHandler] Falló la recuperación: $e');
@@ -270,7 +275,12 @@ class FritoAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler 
         if (isHls) {
           debugPrint('[FritoAudioHandler] Reproduciendo YouTube vía HLS nativo: $playPath');
           effectivePlayUrl = playPath;
-          headers = {'User-Agent': StreamClientUtils.safariUserAgent};
+          final profile = StreamClientUtils.resolveRequestProfile(playPath);
+          headers = {
+            'User-Agent': profile.userAgent,
+            if (profile.origin != null) 'Origin': profile.origin!,
+            if (profile.referer != null) 'Referer': profile.referer!,
+          };
         } else if (isYouTube) {
           try {
             final profile = StreamClientUtils.resolveRequestProfile(playPath);
@@ -311,7 +321,12 @@ class FritoAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler 
               String freshEffective = freshUrl;
               Map<String, String>? freshHeaders;
               if (isYtHls) {
-                freshHeaders = {'User-Agent': StreamClientUtils.safariUserAgent};
+                final profile = StreamClientUtils.resolveRequestProfile(freshUrl);
+                freshHeaders = {
+                  'User-Agent': profile.userAgent,
+                  if (profile.origin != null) 'Origin': profile.origin!,
+                  if (profile.referer != null) 'Referer': profile.referer!,
+                };
               } else if (isYtFresh) {
                 final profile = StreamClientUtils.resolveRequestProfile(freshUrl);
                 final localProxyUri = await YouTubeStreamProxy.instance.registerStream(
@@ -339,13 +354,19 @@ class FritoAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler 
       } else {
         await _player.setFilePath(playPath);
       }
-      await _player.play();
+
+      // IMPORTANTE: liberar _isSettingSource y marcar _userWantedPlaying ANTES de play(),
+      // porque en just_audio el Future de play() no completa hasta que termina la pista.
+      _stopRequested = false;
+      _userWantedPlaying = true;
+      _isSettingSource = false;
+
+      unawaited(_player.play());
+
       final sessionId = _player.androidAudioSessionId;
       if (sessionId != null) {
         EqualizerService.instance.init(sessionId);
       }
-      _stopRequested = false;
-      _userWantedPlaying = true;
     } catch (e) {
       debugPrint('[FritoAudioHandler] Error final en reproducción: $e');
       StreamErrorBus.report('No se pudo reproducir el audio. Si el contenido está '

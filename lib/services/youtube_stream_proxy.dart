@@ -1,19 +1,14 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:typed_data';
+import 'package:flutter/foundation.dart';
 
 class YouTubeStreamProxy {
   static final YouTubeStreamProxy instance = YouTubeStreamProxy._internal();
   YouTubeStreamProxy._internal();
 
   HttpServer? _server;
-  final HttpClient _httpClient = HttpClient()
-    ..idleTimeout = const Duration(seconds: 30)
-    ..connectionTimeout = const Duration(seconds: 15);
-
   final Map<String, _StreamSession> _sessions = {};
-
-  // Bloques de 512 KB para evitar el estrangulamiento y corte de ~1 MiB (30-60s) de googlevideo.com
-  static const int _chunkSize = 512 * 1024;
 
   Future<void> ensureInitialized() async {
     if (_server != null) return;
@@ -21,7 +16,6 @@ class YouTubeStreamProxy {
     _server!.listen(_handleRequest, onError: (_) {});
   }
 
-  /// Registra una URL de googlevideo.com y devuelve una URI local (http://127.0.0.1:port/stream/id)
   Future<Uri> registerStream({
     required String streamUrl,
     required String userAgent,
@@ -30,13 +24,15 @@ class YouTubeStreamProxy {
   }) async {
     await ensureInitialized();
 
-    final String id = DateTime.now().microsecondsSinceEpoch.toString();
-    if (_sessions.length > 8) {
-      _sessions.remove(_sessions.keys.first);
+    // Limpiamos sesiones antiguas para liberar RAM inmediatamente
+    if (_sessions.length >= 2) {
+      final oldestKey = _sessions.keys.first;
+      _sessions.remove(oldestKey)?.dispose();
     }
 
-    // Intentamos extraer clen (contentLength) o mime directamente de la URL de googlevideo si no fueron provistos
-    final parsedUri = Uri.parse(streamUrl);
+    final String id = DateTime.now().microsecondsSinceEpoch.toString();
+    final Uri parsedUri = Uri.parse(streamUrl);
+
     final int? inferredLength = contentLength ??
         int.tryParse(parsedUri.queryParameters['clen'] ?? '');
     final String? rawMime = parsedUri.queryParameters['mime'];
@@ -44,12 +40,17 @@ class YouTubeStreamProxy {
         ? Uri.decodeComponent(rawMime).split(';').first
         : mimeType;
 
-    _sessions[id] = _StreamSession(
-      uri: parsedUri,
+    final session = _StreamSession(
+      id: id,
+      rawUrl: streamUrl,
       userAgent: userAgent,
-      contentLength: inferredLength,
+      totalLength: inferredLength,
       mimeType: effectiveMime,
     );
+
+    _sessions[id] = session;
+    // Iniciamos la descarga por chunks de 512 KB en segundo plano de inmediato
+    unawaited(session.startDownloading());
 
     return Uri.parse('http://127.0.0.1:${_server!.port}/stream/$id');
   }
@@ -70,9 +71,11 @@ class YouTubeStreamProxy {
         return;
       }
 
-      // 1. Parsear el rango solicitado por ExoPlayer / AVPlayer
+      // Esperamos hasta que al menos los primeros bytes o el totalLength estén listos
+      await session.waitForInitialHeader();
+
       int startByte = 0;
-      int? endByte = session.contentLength != null ? session.contentLength! - 1 : null;
+      int? endByte = session.totalLength != null ? session.totalLength! - 1 : null;
 
       final rangeHeader = req.headers.value(HttpHeaders.rangeHeader);
       if (rangeHeader != null && rangeHeader.startsWith('bytes=')) {
@@ -83,148 +86,294 @@ class YouTubeStreamProxy {
         }
       }
 
-      // 2. Si aún no tenemos contentLength, hacemos un probe rápido al servidor
-      if (session.contentLength == null) {
-        await _probeTotalLength(session);
-        if (session.contentLength != null && endByte == null) {
-          endByte = session.contentLength! - 1;
-        }
-      }
+      final int? totalLength = session.totalLength;
 
-      final int? totalLength = session.contentLength;
-
-      // 3. Configurar cabeceras de respuesta 206 Partial Content para soportar Seek (barra de progreso)
+      req.response.bufferOutput = false;
       req.response.statusCode = HttpStatus.partialContent;
       req.response.headers.set(HttpHeaders.contentTypeHeader, session.mimeType);
       req.response.headers.set(HttpHeaders.acceptRangesHeader, 'bytes');
       req.response.headers.set(HttpHeaders.connectionHeader, 'keep-alive');
 
-      if (totalLength != null) {
+      if (totalLength != null && totalLength > 0) {
         final int effectiveEnd = (endByte != null && endByte < totalLength)
             ? endByte
             : (totalLength - 1);
+        if (startByte >= totalLength) {
+          req.response.statusCode = HttpStatus.requestedRangeNotSatisfiable;
+          await req.response.close();
+          return;
+        }
         final int contentLen = (effectiveEnd - startByte) + 1;
         req.response.headers.set(HttpHeaders.contentLengthHeader, contentLen.toString());
         req.response.headers.set(
           HttpHeaders.contentRangeHeader,
           'bytes $startByte-$effectiveEnd/$totalLength',
         );
+        endByte = effectiveEnd;
       }
 
-      // Si el reproductor solo envió una petición HEAD para verificar metadatos, cerramos aquí
       if (req.method.toUpperCase() == 'HEAD') {
         await req.response.close();
         return;
       }
 
-      // 4. Descargar de googlevideo.com en chunks cerrados de 512 KB e inyectarlos al reproductor
-      int currentStart = startByte;
-      final int? targetEnd = endByte ?? (totalLength != null ? totalLength - 1 : null);
-
-      while (targetEnd == null || currentStart <= targetEnd) {
-        int currentEnd = currentStart + _chunkSize - 1;
-        if (targetEnd != null && currentEnd > targetEnd) {
-          currentEnd = targetEnd;
-        }
-
-        // Enviamos el rango acotado mediante el parámetro &range=start-end en la URL de googlevideo.com
-        // (evita el throttling y evita el bloqueo de 1 MiB de YouTube)
-        final Map<String, String> queryParams = Map<String, String>.from(session.uri.queryParameters);
-        queryParams['range'] = '$currentStart-$currentEnd';
-        final Uri chunkUri = session.uri.replace(queryParameters: queryParams);
-
-        final HttpClientRequest ytReq = await _httpClient.getUrl(chunkUri);
-        ytReq.headers.set(HttpHeaders.userAgentHeader, session.userAgent);
-        ytReq.headers.set(HttpHeaders.acceptHeader, '*/*');
-        ytReq.headers.set(HttpHeaders.connectionHeader, 'keep-alive');
-        ytReq.headers.set('Origin', 'https://music.youtube.com');
-        ytReq.headers.set('Referer', 'https://music.youtube.com/');
-
-        final HttpClientResponse ytRes = await ytReq.close();
-
-        // Si el servidor ignora el query param &range=, reintentamos con el header Range estándar
-        if (ytRes.statusCode != HttpStatus.ok && ytRes.statusCode != HttpStatus.partialContent) {
-          await ytRes.drain();
-          final HttpClientRequest fallbackReq = await _httpClient.getUrl(session.uri);
-          fallbackReq.headers.set(HttpHeaders.userAgentHeader, session.userAgent);
-          fallbackReq.headers.set(HttpHeaders.rangeHeader, 'bytes=$currentStart-$currentEnd');
-          fallbackReq.headers.set(HttpHeaders.acceptHeader, '*/*');
-          final HttpClientResponse fallbackRes = await fallbackReq.close();
-
-          if (fallbackRes.statusCode != HttpStatus.ok &&
-              fallbackRes.statusCode != HttpStatus.partialContent) {
-            await fallbackRes.drain();
-            break;
-          }
-
-          int receivedFallback = 0;
-          await for (final data in fallbackRes) {
-            req.response.add(data);
-            receivedFallback += data.length;
-          }
-          await req.response.flush();
-
-          final int expected = (currentEnd - currentStart) + 1;
-          if (receivedFallback < expected || receivedFallback == 0) break;
-          currentStart = currentEnd + 1;
-          continue;
-        }
-
-        int received = 0;
-        await for (final data in ytRes) {
-          req.response.add(data);
-          received += data.length;
-        }
-        await req.response.flush();
-
-        final int expected = (currentEnd - currentStart) + 1;
-        if (received < expected || received == 0) {
-          break; // Llegamos al final del stream
-        }
-
-        currentStart = currentEnd + 1;
-      }
-
+      // Si el usuario adelantó la canción a un punto que aún no se ha descargado,
+      // servimos desde el buffer en cuanto llegue o abrimos lectura directa
+      await session.streamRangeToResponse(req.response, startByte, endByte);
       await req.response.close();
     } catch (_) {
-      // Si el usuario adelanta la canción o cambia de pista, ExoPlayer cierra el socket anterior.
       try {
         await req.response.close();
       } catch (_) {}
     }
   }
 
-  Future<void> _probeTotalLength(_StreamSession session) async {
-    try {
-      final probeReq = await _httpClient.getUrl(session.uri);
-      probeReq.headers.set(HttpHeaders.userAgentHeader, session.userAgent);
-      probeReq.headers.set(HttpHeaders.rangeHeader, 'bytes=0-1');
-      final probeRes = await probeReq.close();
-      final contentRange = probeRes.headers.value(HttpHeaders.contentRangeHeader);
-      if (contentRange != null && contentRange.contains('/')) {
-        final totalStr = contentRange.split('/').last;
-        session.contentLength = int.tryParse(totalStr);
-      }
-      await probeRes.drain();
-    } catch (_) {}
-  }
-
   Future<void> stop() async {
+    for (final s in _sessions.values) {
+      s.dispose();
+    }
+    _sessions.clear();
     await _server?.close(force: true);
     _server = null;
   }
 }
 
 class _StreamSession {
-  final Uri uri;
+  final String id;
+  final String rawUrl;
   final String userAgent;
-  int? contentLength;
+  int? totalLength;
   final String mimeType;
 
+  static const int _chunkSize = 512 * 1024; // 512 KB por bloque
+
+  final List<int> _buffer = <int>[];
+  bool _isCompleted = false;
+  bool _isDisposed = false;
+  bool _hasFailed = false;
+  final List<Completer<void>> _waiters = <Completer<void>>[];
+
+  final HttpClient _httpClient = HttpClient()
+    ..idleTimeout = const Duration(seconds: 30)
+    ..connectionTimeout = const Duration(seconds: 15);
+
   _StreamSession({
-    required this.uri,
+    required this.id,
+    required this.rawUrl,
     required this.userAgent,
-    this.contentLength,
+    required this.totalLength,
     required this.mimeType,
   });
+
+  void _notifyWaiters() {
+    for (final waiter in _waiters) {
+      if (!waiter.isCompleted) {
+        waiter.complete();
+      }
+    }
+    _waiters.clear();
+  }
+
+  Future<void> _waitForMoreData() {
+    if (_isCompleted || _hasFailed || _isDisposed) {
+      return Future.value();
+    }
+    final completer = Completer<void>();
+    _waiters.add(completer);
+    return completer.future;
+  }
+
+  Future<void> waitForInitialHeader() async {
+    while (!_isDisposed && !_isCompleted && !_hasFailed && _buffer.isEmpty && totalLength == null) {
+      await _waitForMoreData();
+    }
+  }
+
+  /// Construye la URL con &range=start-end SIN re-codificar ni romper la firma de googlevideo.com
+  Uri _buildChunkUri(String baseRawUrl, int start, int end) {
+    String cleaned = baseRawUrl.replaceAll(RegExp(r'([?&])range=[^&]*'), '');
+    final String sep = cleaned.contains('?') ? '&' : '?';
+    return Uri.parse('$cleaned${sep}range=$start-$end');
+  }
+
+  /// Abre petición HTTP siguiendo manualmente redirects 302 para no perder el User-Agent ni Range
+  Future<HttpClientResponse?> _openChunkRequest(
+    String targetUrl,
+    int start,
+    int end, {
+    required bool useQueryParamRange,
+  }) async {
+    Uri currentUri = useQueryParamRange
+        ? _buildChunkUri(targetUrl, start, end)
+        : Uri.parse(targetUrl);
+
+    for (int redirectCount = 0; redirectCount < 5; redirectCount++) {
+      final req = await _httpClient.getUrl(currentUri);
+      req.followRedirects = false;
+      req.headers.set(HttpHeaders.userAgentHeader, userAgent);
+      req.headers.set(HttpHeaders.acceptHeader, '*/*');
+      req.headers.set(HttpHeaders.connectionHeader, 'keep-alive');
+      if (!useQueryParamRange) {
+        req.headers.set(HttpHeaders.rangeHeader, 'bytes=$start-$end');
+      }
+
+      final res = await req.close();
+      if (res.statusCode == HttpStatus.movedPermanently ||
+          res.statusCode == HttpStatus.found ||
+          res.statusCode == HttpStatus.seeOther ||
+          res.statusCode == HttpStatus.temporaryRedirect ||
+          res.statusCode == HttpStatus.permanentRedirect) {
+        final location = res.headers.value(HttpHeaders.locationHeader);
+        await res.drain();
+        if (location == null || location.isEmpty) return null;
+        currentUri = currentUri.resolve(location);
+        continue;
+      }
+      return res;
+    }
+    return null;
+  }
+
+  Future<void> startDownloading() async {
+    int currentStart = 0;
+    int retries = 0;
+
+    while (!_isDisposed && (totalLength == null || currentStart < totalLength!)) {
+      int currentEnd = currentStart + _chunkSize - 1;
+      if (totalLength != null && currentEnd >= totalLength!) {
+        currentEnd = totalLength! - 1;
+      }
+
+      try {
+        // Intento 1: Usando parámetro &range=start-end en URL cruda (evita throttling de YouTube)
+        HttpClientResponse? res = await _openChunkRequest(
+          rawUrl,
+          currentStart,
+          currentEnd,
+          useQueryParamRange: true,
+        );
+
+        // Intento 2 (Fallback): Usando cabecera HTTP Range: bytes=start-end
+        if (res == null ||
+            (res.statusCode != HttpStatus.ok && res.statusCode != HttpStatus.partialContent)) {
+          await res?.drain();
+          res = await _openChunkRequest(
+            rawUrl,
+            currentStart,
+            currentEnd,
+            useQueryParamRange: false,
+          );
+        }
+
+        if (res == null ||
+            (res.statusCode != HttpStatus.ok && res.statusCode != HttpStatus.partialContent)) {
+          await res?.drain();
+          retries++;
+          if (retries > 3) {
+            debugPrint('[YouTubeStreamProxy] Fallo definitivo en byte $currentStart');
+            _hasFailed = true;
+            _notifyWaiters();
+            break;
+          }
+          await Future.delayed(Duration(milliseconds: 250 * retries));
+          continue;
+        }
+
+        // Extraer totalLength desde Content-Range o Content-Length si aún no lo teníamos
+        if (totalLength == null) {
+          final contentRange = res.headers.value(HttpHeaders.contentRangeHeader);
+          if (contentRange != null && contentRange.contains('/')) {
+            final totalStr = contentRange.split('/').last;
+            final parsedTotal = int.tryParse(totalStr);
+            if (parsedTotal != null && parsedTotal > 0) {
+              totalLength = parsedTotal;
+            }
+          } else if (res.statusCode == HttpStatus.ok && res.contentLength > 0 && currentStart == 0) {
+            totalLength = res.contentLength;
+          }
+        }
+
+        int receivedInChunk = 0;
+        await for (final List<int> data in res) {
+          if (_isDisposed) break;
+          _buffer.addAll(data);
+          receivedInChunk += data.length;
+          _notifyWaiters();
+        }
+
+        if (receivedInChunk == 0) {
+          // Fin real del stream
+          totalLength ??= _buffer.length;
+          _isCompleted = true;
+          _notifyWaiters();
+          break;
+        }
+
+        retries = 0;
+        // IMPORTANTE: Avanzamos exactamente la cantidad de bytes recibidos (nunca romper si received < 512KB)
+        currentStart += receivedInChunk;
+
+        if (totalLength != null && currentStart >= totalLength!) {
+          _isCompleted = true;
+          _notifyWaiters();
+          break;
+        }
+      } catch (e) {
+        retries++;
+        if (retries > 3) {
+          _hasFailed = true;
+          _notifyWaiters();
+          break;
+        }
+        await Future.delayed(Duration(milliseconds: 250 * retries));
+      }
+    }
+
+    _isCompleted = true;
+    _notifyWaiters();
+  }
+
+  Future<void> streamRangeToResponse(
+    HttpResponse response,
+    int startByte,
+    int? endByte,
+  ) async {
+    int cursor = startByte;
+    const int writeBatchSize = 64 * 1024; // Entregar en bloques de 64 KB al socket local
+
+    while (!_isDisposed) {
+      final int? targetEnd = endByte ?? (totalLength != null ? totalLength! - 1 : null);
+      if (targetEnd != null && cursor > targetEnd) {
+        break;
+      }
+
+      if (cursor < _buffer.length) {
+        int availableEnd = _buffer.length - 1;
+        if (targetEnd != null && availableEnd > targetEnd) {
+          availableEnd = targetEnd;
+        }
+        if (availableEnd - cursor + 1 > writeBatchSize) {
+          availableEnd = cursor + writeBatchSize - 1;
+        }
+
+        final Uint8List slice = Uint8List.fromList(
+          _buffer.sublist(cursor, availableEnd + 1),
+        );
+        response.add(slice);
+        await response.flush();
+        cursor = availableEnd + 1;
+      } else if (_isCompleted || _hasFailed) {
+        break;
+      } else {
+        await _waitForMoreData();
+      }
+    }
+  }
+
+  void dispose() {
+    _isDisposed = true;
+    _notifyWaiters();
+    _buffer.clear();
+    _httpClient.close(force: true);
+  }
 }
